@@ -110,6 +110,57 @@ def get_random_mask(shape, image_start_only=False):
             mask[:, :, :, :] = 1
     return mask
 
+
+def get_flf2v_mask(
+    video_length: int,
+    height: int,
+    width: int,
+    vae_stride_t: int = 4,
+    vae_stride_h: int = 8,
+    vae_stride_w: int = 8,
+) -> torch.Tensor:
+    """
+    First-Last-Frame-to-Video (FLF2V) conditioning mask.
+
+    Returns a binary mask in VAE latent space where frame 0 (first) and
+    frame -1 (last) are set to 1.0 (pinned / conditioned) and all
+    intermediate latent frames are 0.0 (free / to be generated).
+
+    Args:
+        video_length:  number of video frames in pixel space. Must satisfy
+                       (video_length - 1) % vae_stride_t == 0.
+                       Default Wan config: video_length=81, vae_stride_t=4
+                       → lat_t = (81-1)//4 + 1 = 21.
+        height, width: video resolution in pixels.
+                       Default 720p: lat_h = 720//8 = 90, lat_w = 1280//8 = 160.
+        vae_stride_*:  VAE compression strides. For Wan2.1 VAE (I2V-A14B):
+                       temporal=4, spatial=8×8.
+
+    Returns:
+        mask: torch.Tensor [1, 1, lat_t, lat_h, lat_w]  float32
+              Values: 1.0 at latent frames 0 and -1, 0.0 elsewhere.
+
+    Usage in pipeline:
+        mask  = get_flf2v_mask(81, 720, 1280)          # [1,1,21,90,160]
+        y     = torch.zeros(1, vae_c, lat_t, lat_h, lat_w)
+        y[:, :, 0]  = z_first                          # VAE latent of frame 0
+        y[:, :, -1] = z_last                           # VAE latent of last frame
+        # Then pass mask and y into the DiT conditioning path (same as I2V).
+    """
+    assert (video_length - 1) % vae_stride_t == 0, (
+        f"video_length={video_length} incompatible with vae_stride_t={vae_stride_t}. "
+        f"video_length must be vae_stride_t * n + 1."
+    )
+    lat_t = (video_length - 1) // vae_stride_t + 1
+    lat_h = height // vae_stride_h
+    lat_w = width  // vae_stride_w
+
+    mask = torch.zeros(1, 1, lat_t, lat_h, lat_w, dtype=torch.float32)
+    mask[:, :,  0, :, :] = 1.0
+    mask[:, :, -1, :, :] = 1.0
+    return mask
+
+
 @contextmanager
 def VideoReader_contextmanager(*args, **kwargs):
     vr = VideoReader(*args, **kwargs)

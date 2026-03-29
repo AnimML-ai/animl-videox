@@ -535,6 +535,7 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
         boundary: float = 0.875,
         comfyui_progressbar: bool = False,
         shift: int = 5,
+        gld_f1_latents: Optional[torch.FloatTensor] = None,
     ) -> Union[WanPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -849,16 +850,22 @@ class Wan2_2FunControlPipeline(DiffusionPipeline):
                     local_transformer = self.transformer
                 
                 # predict noise model_output
-                with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=device):
+                # Support multi-GPU: move inputs to wherever this transformer lives.
+                t_dev = next(local_transformer.parameters()).device
+                def _to(x):
+                    return x.to(t_dev) if isinstance(x, torch.Tensor) else x
+                with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=t_dev):
                     noise_pred = local_transformer(
-                        x=latent_model_input,
-                        context=in_prompt_embeds,
-                        t=timestep,
+                        x=[_to(u) for u in latent_model_input] if isinstance(latent_model_input, list) else _to(latent_model_input),
+                        context=[_to(u) for u in in_prompt_embeds] if isinstance(in_prompt_embeds, list) else _to(in_prompt_embeds),
+                        t=_to(timestep),
                         seq_len=seq_len,
-                        y=control_latents_input,
-                        y_camera=control_camera_latents_input, 
-                        full_ref=full_ref,
+                        y=_to(control_latents_input),
+                        y_camera=_to(control_camera_latents_input),
+                        full_ref=_to(full_ref),
+                        gld_f1_latents=_to(gld_f1_latents),
                     )
+                noise_pred = noise_pred.to(device)
 
                 # perform guidance
                 if do_classifier_free_guidance:

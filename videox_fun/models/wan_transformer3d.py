@@ -554,6 +554,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         add_ref_conv=False,
         in_dim_ref_conv=16,
         cross_attn_type=None,
+        add_gld_projector: bool = False,
+        n_gld_keyframes: int = 4,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -658,6 +660,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:], downscale_factor=downscale_factor_control_adapter)
         else:
             self.control_adapter = None
+
+        # AniML: GLD geometry projector
+        if add_gld_projector:
+            from .gld_projector import GLDProjector
+            self.gld_projector = GLDProjector(
+                in_dim=1536,
+                out_dim=dim,
+                n_keyframes=n_gld_keyframes,
+            )
+        else:
+            self.gld_projector = None
 
         if add_ref_conv:
             self.ref_conv = nn.Conv2d(in_dim_ref_conv, dim, kernel_size=patch_size[1:], stride=patch_size[1:])
@@ -786,6 +799,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         full_ref=None,
         subject_ref=None,
         cond_flag=True,
+        gld_f1_latents: torch.Tensor = None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -900,6 +914,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
+
+        # AniML: append GLD geometry tokens to T5 context
+        if self.gld_projector is not None and gld_f1_latents is not None:
+            # gld_f1_latents: [N_keyframes, T_tokens, 1536]  (on same device as model)
+            gld_tokens = self.gld_projector(gld_f1_latents)
+            # gld_tokens: [N_kf * T_tokens, out_dim]
+            # context: [B, seq_t5, out_dim]
+            B = context.shape[0]
+            gld_tokens = gld_tokens.unsqueeze(0).expand(B, -1, -1)
+            context = torch.cat([context, gld_tokens], dim=1)
 
         # Context Parallel
         if self.sp_world_size > 1:
@@ -1329,6 +1353,8 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
         downscale_factor_control_adapter=8,
         add_ref_conv=False,
         in_dim_ref_conv=16,
+        add_gld_projector: bool = False,
+        n_gld_keyframes: int = 4,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -1387,6 +1413,8 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
             downscale_factor_control_adapter=downscale_factor_control_adapter,
             add_ref_conv=add_ref_conv,
             in_dim_ref_conv=in_dim_ref_conv,
+            add_gld_projector=add_gld_projector,
+            n_gld_keyframes=n_gld_keyframes,
             cross_attn_type="cross_attn"
         )
         

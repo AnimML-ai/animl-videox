@@ -153,7 +153,7 @@ def build_inpaint_y(pixel_values: torch.Tensor, vae, device, dtype) -> torch.Ten
 
     # Encode masked video with frozen VAE
     with torch.no_grad():
-        masked_latents = vae.encode(masked_video.to(dtype))[0].sample()   # [B, 16, T_lat, H_lat, W_lat]
+        masked_latents = vae.encode(masked_video.to(dtype))[0].mode()      # [B, 16, T_lat, H_lat, W_lat]
 
     # Pack mask to match latent temporal stride (same pattern as pipeline)
     mask_packed = torch.concat([
@@ -167,7 +167,13 @@ def build_inpaint_y(pixel_values: torch.Tensor, vae, device, dtype) -> torch.Ten
     mask_latents = resize_mask(1.0 - mask_packed, masked_latents, True).to(device, dtype)
     # 1-mask_packed: 1 at t=0 (frame is conditioned), 0 elsewhere
 
-    return torch.cat([mask_latents, masked_latents], dim=1)                 # [B, 20, T_lat, H_lat, W_lat]
+    y = torch.cat([mask_latents, masked_latents], dim=1)
+    expected_y_ch = 4 + vae.latent_channels
+    assert y.shape[1] == expected_y_ch, (
+        f"y channel count {y.shape[1]} != expected {expected_y_ch}. "
+        f"Verify transformer control adapter in_channels."
+    )
+    return y                                                                 # [B, 20, T_lat, H_lat, W_lat]
 
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
@@ -198,11 +204,10 @@ class AniMLDataset(torch.utils.data.Dataset):
         with open(jsonl_path) as f:
             for line in f:
                 s = json.loads(line.strip())
-                # Quick NaN check on first and last pose
+                # NaN check across all poses
                 try:
-                    p0 = np.array(s["da3_w2c_raw"][0], dtype=np.float32)
-                    pm = np.array(s["da3_w2c_raw"][-1], dtype=np.float32)
-                    if np.isnan(p0).any() or np.isnan(pm).any():
+                    all_poses = np.array(s["da3_w2c_raw"], dtype=np.float32)  # [N, 3, 4]
+                    if np.isnan(all_poses).any():
                         nan_count += 1
                         continue
                 except Exception:
@@ -377,6 +382,10 @@ def parse_args():
     p.add_argument("--num_workers",               type=int,   default=2)
 
     # Memory
+    p.add_argument("--hint_dropout_prob", type=float, default=0.1,
+                   help="Probability of zeroing each conditioning signal per step "
+                        "(inpaint y and camera y_camera independently). "
+                        "Required for CFG to work at inference.")
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--vae_mini_batch",         type=int, default=1)
 
@@ -394,6 +403,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.boundary_type == "both" and args.train_batch_size > 1:
+        raise ValueError(
+            "--boundary_type=both with batch_size > 1 routes all samples in a "
+            "batch to a single transformer based on mean timestep. "
+            "Use --train_batch_size 1 or --boundary_type low/high."
+        )
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -553,9 +569,18 @@ def main():
     device = accelerator.device
     vae.to(device, dtype=weight_dtype)
     text_encoder.to(device, dtype=weight_dtype)
-    if args.boundary_type in ("low",  "both"): transformer_low.to(device)
-    if args.boundary_type in ("high", "both") and transformer_high is not None:
-        transformer_high.to(device)
+    if args.boundary_type == "both" and torch.cuda.device_count() >= 2:
+        # Model-parallel split: low on cuda:0, high on cuda:1.
+        # Mirrors the inference pipeline's multi_gpu mode so both 14B transformers
+        # fit on two 80 GB A100s without OOM.
+        transformer_low.to(torch.device("cuda:0"))
+        if transformer_high is not None:
+            transformer_high.to(torch.device("cuda:1"))
+        logger.info("boundary_type=both: transformer_low→cuda:0, transformer_high→cuda:1")
+    else:
+        if args.boundary_type in ("low",  "both"): transformer_low.to(device)
+        if args.boundary_type in ("high", "both") and transformer_high is not None:
+            transformer_high.to(device)
 
     # ── Checkpoint saving helper ───────────────────────────────────────────────
     def save_checkpoint(step: int):
@@ -615,7 +640,7 @@ def main():
                 # ── VAE encode video ──────────────────────────────────────────
                 video_BCTHW = pixel_values.permute(0, 2, 1, 3, 4)  # [B, 3, T, H, W]
                 with torch.no_grad():
-                    latents = vae.encode(video_BCTHW)[0].sample()   # [B, 16, T_lat, H_lat, W_lat]
+                    latents = vae.encode(video_BCTHW)[0].mode()   # [B, 16, T_lat, H_lat, W_lat]
 
                 # ── Build camera conditioning (y_camera) ──────────────────────
                 y_camera = build_y_camera(plucker)   # [B, 24, T_lat, H, W]
@@ -623,6 +648,13 @@ def main():
                 # ── Build I2V inpaint conditioning (y) ────────────────────────
                 y = build_inpaint_y(pixel_values, vae, device, weight_dtype)
                 # [B, 20, T_lat, H_lat, W_lat]
+
+                # ── Hint dropout (for CFG compatibility) ──────────────────────
+                if args.hint_dropout_prob > 0.0:
+                    if torch.rand(1).item() < args.hint_dropout_prob:
+                        y = torch.zeros_like(y)
+                    if torch.rand(1).item() < args.hint_dropout_prob:
+                        y_camera = torch.zeros_like(y_camera)
 
                 # ── Encode text ───────────────────────────────────────────────
                 with torch.no_grad():
@@ -662,17 +694,22 @@ def main():
                     )
 
                 # ── Forward pass ──────────────────────────────────────────────
-                with torch.cuda.amp.autocast(dtype=weight_dtype):
+                # Move inputs to wherever this transformer lives (multi-GPU safe).
+                t_dev = next(active_transformer.parameters()).device
+                def _to(x):
+                    return x.to(t_dev) if isinstance(x, torch.Tensor) else x
+                with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(t_dev):
                     noise_pred = active_transformer(
-                        x=noisy_latents,
-                        context=prompt_embeds,
-                        t=timesteps,
+                        x=_to(noisy_latents),
+                        context=[_to(e) for e in prompt_embeds],
+                        t=_to(timesteps),
                         seq_len=seq_len,
-                        y=y,
-                        y_camera=y_camera,
+                        y=_to(y),
+                        y_camera=_to(y_camera),
                         full_ref=None,
                         gld_f1_latents=None,
                     )
+                noise_pred = noise_pred.to(device)
 
                 # ── Loss ──────────────────────────────────────────────────────
                 weighting = compute_loss_weighting_for_sd3(

@@ -53,7 +53,7 @@ def so3_log(R: np.ndarray) -> np.ndarray:
         diag = np.diag(R)
         i = int(np.argmax(diag))
         axis = R[:, i] + np.eye(3)[i]
-        axis = axis / np.linalg.norm(axis)
+        axis = axis / (np.linalg.norm(axis) + 1e-8)
         return axis * theta
     return (theta / (2.0 * np.sin(theta))) * np.array([
         R[2, 1] - R[1, 2],
